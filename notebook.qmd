@@ -1,0 +1,1088 @@
+---
+title: Sales Analysis
+author: AndhikaWB
+date: last-modified
+date-format: long
+format:
+  gfm:
+    output-file: notebook.md
+knitr:
+  opts_chunk:
+    echo: true
+    error: true
+    cache: true
+    results: hold
+---
+
+# BigQuery
+
+## Set Up Docker Container
+
+Bundle the official [gcloud Docker image](https://cloud.google.com/sdk/docs/downloads-docker) with our CSV data
+
+```  {sh build-image}
+# Build only if the image doesn't exist yet
+# Must be on the same dir as the Dockerfile
+if [ ! "$(docker images -q bq-image)" ]; then
+  docker build -t bq-image .
+fi
+```
+
+Run the container with name `bqc`
+
+``` {sh start-image}
+if [ ! "$(docker ps -qa -f name=bqc)" ]; then
+  docker run -dit --name bqc bq-image
+else
+  docker start bqc
+fi
+```
+
+## Set Up Gcloud and Project
+
+Run the auth process to generate login info (if you don't have the credentials already)
+
+**Note:** Run it manually on your terminal, Quarto doesn't support interactive input
+
+``` {sh gcloud-login}
+#| eval: false
+
+docker exec -it bqc sh -c "gcloud auth login"
+```
+
+Set the current active account after login
+
+**Note:** Set the email by editing `_environment` file. The output of this code is hidden to prevent email leakage
+
+``` {sh set-account}
+#| output: false
+
+# Check authenticated account list
+docker exec bqc sh -c "gcloud auth list"
+# Set current active account (using email)
+docker exec -e USER_EMAIL=$USER_EMAIL bqc sh -c "gcloud config set account $USER_EMAIL"
+```
+
+Set the project ID. You may need to create a [Google Cloud](https://console.cloud.google.com) project first and copy the ID
+
+``` {sh set-project}
+docker exec bqc sh -c "gcloud config set project mumu-431300"
+```
+
+## Prepare SQL Tables
+
+[Enable BigQuery API](https://console.cloud.google.com/marketplace/product/google/bigquery.googleapis.com) on your project, then we can make (`mk`) a sample [dataset](https://cloud.google.com/bigquery/docs/datasets) called `sales_data`
+
+You can also override project ID manually via `--project_id=XXX` parameter
+
+``` {sh create-dataset}
+docker exec bqc sh -c "bq --location=asia-southeast1 mk sales_data"
+```
+
+[Import CSV](https://cloud.google.com/bigquery/docs/loading-data-cloud-storage-csv) files (as tables) to `sales_data` dataset. Use `--autodetect` to figure out table schema types automatically
+
+``` {sh import-tables}
+docker exec bqc sh -c "
+  bq load --replace --autodetect --source_format=CSV sales_data.customer customers.csv
+  bq load --replace --autodetect --source_format=CSV sales_data.order orders.csv
+  bq load --replace --autodetect --source_format=CSV sales_data.product products.csv
+  bq load --replace --autodetect --source_format=CSV sales_data.productcategory productcategory.csv
+"
+```
+
+Run a test query by checking the `order` table, and see whether `OrderID` is unique or not
+
+``` {sh test-query}
+docker exec bqc sh -c '
+  bq query --use_legacy_sql=false "
+    SELECT * FROM sales_data.order LIMIT 1;
+
+    SELECT
+      COUNT(*) AS count_row,
+      COUNT(DISTINCT OrderID) AS count_order
+    FROM
+      sales_data.order
+  "
+'
+```
+
+That works, and we can see that `OrderID` is unique
+
+However, the command is too long and doesn't have syntax highlighting, so we will set up a native SQL solution using the `bigrquery` library
+
+**Note:** You need R installed to make this work
+
+``` {r setup-sql-connection}
+#| cache: false
+
+library(DBI)
+library(bigrquery)
+
+cred_file <- paste0(
+  'docker/root/.config/gcloud/legacy_credentials/',
+  Sys.getenv('USER_EMAIL'), '/adc.json'
+)
+
+Sys.setenv(GOOGLE_APPLICATION_CREDENTIALS = cred_file)
+bq_auth()
+
+con <- dbConnect(
+  bigquery(), 
+  dataset = 'sales_data', 
+  project = 'mumu-431300', 
+  use_legacy_sql = FALSE
+)
+
+# Set default SQL "connection" cell option
+knitr::opts_chunk$set(connection = con)
+
+# Print query result as text instead of markdown table
+knitr::opts_knit$set(sql.print = function(x) {
+  paste('   ', knitr::kable(x, format = 'simple'), collapse = '\n')
+})
+```
+
+Now we test the SQL query again, but this time using native SQL
+
+``` {sql test-query-sql}
+SELECT * FROM sales_data.order LIMIT 1;
+
+SELECT
+  COUNT(*) AS count_row,
+  COUNT(DISTINCT OrderID) AS count_order
+FROM
+  sales_data.order
+```
+
+Notice that only the last query will be outputed if you're using this method, which differs from the `bq` tool
+
+We can also check the table schemas in case there is an incorrect data type
+
+**Note:** Use `max.print: X` (cell option) rather than SQL `LIMIT X` to change the row numbers. Though `LIMIT X` may still be useful in case you're billed per query
+
+``` {sql check-schema}
+#| max.print: 100
+
+SELECT
+  table_name, column_name, data_type, is_nullable
+FROM
+  sales_data.INFORMATION_SCHEMA.COLUMNS
+```
+
+Seems like all data types are already correct
+
+Then we can start visualizing the relationship between each table using Mermaid's ER diagram
+
+``` {mermaid er-diagram}
+erDiagram
+
+customer {
+  Int64 CustomerID PK
+  Str FirstName
+  Str LastName
+  Str CustomerEmail
+  Str CustomerPhone
+  Str CustomerAddress
+  Str CustomerCity
+  Str CustomerState
+  Int64 CustomerZip
+}
+
+order {
+    Int64 OrderID PK
+    Date Date
+    Int64 CustomerID FK
+    Str ProdNumber FK
+    Int64 Quantity
+}
+
+product {
+    Str ProdNumber PK
+    Str ProdName
+    Int64 Category FK
+    Float64 Price
+}
+
+productcategory {
+    Int64 CategoryID PK
+    Str CategoryName
+    Str CategoryAbbreviation
+}
+
+customer 1 to many(0) order: has
+product 1 to many(0) order: contains
+productcategory 1 to many(0) product: contains
+```
+
+### Create Transaction Table
+
+Combine all the tables onto 1 master table (let's call it `transaction`)
+
+``` {sql transaction-table-1}
+-- Join product with product category
+WITH product_detail AS (
+  SELECT
+    p.ProdNumber,
+    p.ProdName,
+    pc.CategoryName,
+    p.Price
+  FROM sales_data.product AS p
+  INNER JOIN sales_data.productcategory AS pc
+  ON p.Category = pc.CategoryID
+),
+
+-- Join order with product detail
+order_detail AS (
+  SELECT
+    o.OrderID,
+    o.Date,
+    o.CustomerID,
+    pd.ProdNumber,
+    pd.ProdName,
+    pd.CategoryName,
+    pd.Price,
+    o.Quantity,
+    -- Calculate the total price
+    pd.Price * o.Quantity AS TotalPrice,
+    -- Mark the first purchase of each customer
+    -- OrderID is unique so we only need to check the date
+    ROW_NUMBER() OVER(
+      PARTITION BY o.CustomerID
+      ORDER BY o.Date
+    ) = 1 AS FirstTime
+  FROM sales_data.order AS o
+  INNER JOIN product_detail AS pd
+  ON o.ProdNumber = pd.ProdNumber
+),
+
+-- Join order detail with customer
+transaction AS (
+  SELECT
+    c.CustomerID,
+    c.FirstName,
+    c.LastName,
+    c.CustomerCity,
+    c.CustomerState,
+    c.CustomerZip,
+    od.OrderID,
+    od.Date AS OrderDate,
+    od.ProdNumber AS OrderProdNumber,
+    od.ProdName AS OrderProdName,
+    od.CategoryName AS OrderCategoryName,
+    od.Price AS OrderPrice,
+    od.Quantity AS OrderQuantity,
+    od.TotalPrice AS OrderTotalPrice,
+    od.FirstTime AS OrderFirstTime
+  FROM sales_data.customer AS c
+  INNER JOIN order_detail AS od
+  ON c.CustomerID = od.CustomerID
+)
+
+SELECT * FROM transaction ORDER BY OrderDate
+```
+
+To [create a new table](https://cloud.google.com/bigquery/docs/writing-results) based on the previous query, wrap the query inside the `CREATE TABLE` clause like this:
+
+``` {sql transaction-table-2}
+#| eval: false
+
+CREATE OR REPLACE TABLE
+  sales_data.transaction
+AS (
+  WITH ...
+  SELECT ...
+)
+```
+
+We can also to pass the query (from R) to the `bq` tool as environment variable
+
+However, we don't need the `CREATE TABLE` clause if we're passing it to `bq`. We can just use normal `SELECT` query like we did before
+
+``` {r transaction-table-3}
+#| cache: false
+
+# Reference to reuse chunk code
+# https://yihui.org/knitr/demo/reference/
+# https://bookdown.org/yihui/rmarkdown-cookbook/reuse-chunks.html
+
+query <- '
+  <<transaction-table-1>>
+'
+
+# Escape the newline character
+query <- gsub('\n', '\\\n', query)
+
+# Pass query string as environment variable
+# Also make sure that chunk cache is false
+# If cache is true then the env var may not be shared
+Sys.setenv(QUERY = query)
+```
+
+Then pass the previous `SELECT` query to `bq` using `--destination_table` parameter
+
+``` {sh transaction-table-4}
+docker exec -e QUERY="$QUERY" bqc sh -c '
+  bq query --use_legacy_sql=false \
+  --destination_table sales_data.transaction \
+  --replace --max_rows=10 \
+  "$QUERY"
+'
+```
+
+The above result is the same as using the `CREATE TABLE` clause
+
+However, I prefer using this `bq` approach since it produce an output, as opposed to blank output when using the `bigrquery` library
+
+### Create RFM Table
+
+Now we will create a separate RFM table based on the `transaction` (master) table
+
+- **Recency:** Date diff between today's date (or the last date on table) and the last purchase date of a specific customer. The lower the diff the more recent the purchase is
+- **Frequency:** Count of purchase from a specific customer
+- **Monetary:** Sum of all revenue from a specific customer
+- **Tenure (relationship period):** Days since first purchase from a specific customer (to last purchase date or today's date)
+
+``` {sql rfm-table-1}
+#| eval: false
+
+WITH rfm AS (
+  SELECT
+    CustomerID,
+    MIN(OrderDate) AS FirstPurchase,
+    MAX(OrderDate) AS LastPurchase,
+    -- Tenure, may be useful for CLV or churn later
+    -- First time customers will have 0 age, so we add +1 day
+    DATE_DIFF(MAX(OrderDate) + 1, MIN(OrderDate), DAY) AS Tenure,
+    -- RFM
+    DATE_DIFF(MAX(MaxDate), MAX(OrderDate), DAY) AS Recency,
+    COUNT(DISTINCT OrderID) AS Frequency,
+    SUM(OrderPrice * OrderQuantity) AS Monetary
+  FROM
+  (
+    -- Cant get max date of the table after GROUP BY (only per customer)
+    -- That is why we use this subquery to get table max date first
+    SELECT *, MAX(OrderDate) OVER() AS MaxDate FROM sales_data.transaction
+  )
+  GROUP BY
+    CustomerID
+),
+```
+
+To standardize them all to fixed range/score (e.g. between 1-5), use either:
+
+- `NTILE`: Bins with an equal member distribution for each group
+- `WIDTH_BUCKET`: Bins with an equal range for each group (not available on BigQuery, see [workaround](https://stackoverflow.com/a/63045747))
+- `CASE WHEN X THEN Y`: Bins with a custom defined range for each group
+
+The query below is a continuation of the previous query
+
+``` {sql rfm-table-2}
+#| eval: false
+
+rfm_score AS (
+  SELECT
+    *,
+    NTILE(5) OVER(ORDER BY Recency DESC) AS RecencyScore,
+    NTILE(5) OVER(ORDER BY Frequency) AS FrequencyScore,
+    NTILE(5) OVER(ORDER BY Monetary) AS MonetaryScore
+  FROM rfm
+),
+```
+
+Next is RFM segmentation to group together customers with the same characteristic. However, there is no universal rules for it, some examples I've found:
+
+- Segmentation rules from [Jason Tragakis](https://justdataplease.medium.com/rfm-customer-segmentation-analysis-in-action-9108c906c628)
+- Segmentation rules from [Rsquared Academy](https://blog.rsquaredacademy.com/customer-segmentation-using-rfm-analysis/)
+- Segmentation rules from [Omniconvert](https://www.omniconvert.com/blog/rfm-analysis/)
+- Segmentation rules from [Guillaume Martin](https://guillaume-martin.github.io/rfm-segmentation-with-python.html) (RF score only)
+- Segmentation rules from [Shir Varon](https://medium.com/@shirvaron/customer-segmentation-implementing-the-rfm-model-with-sql-8d07fd990d32) (weighted RFM)
+
+Some other references that are not directly related (but still useful):
+
+- Different kinds of loyalty program from [Loyoly](https://www.loyoly.io/blog/customer-loyalty-program)
+- Segmented customer engagement strategy from [Pushwoosh](https://blog.pushwoosh.com/blog/rfm-segmentation/)
+- Similar as Pushwoosh post above ([similar 1](https://www.barilliance.com/rfm-analysis/), [similar 2](https://www.peelinsights.com/post/rfm-strategy-how-to-engage-your-customer-segments))
+
+Here's the segmentation rules that I decided to use (not exactly the same as above references):
+
+``` {sql rfm-table-3}
+#| eval: false
+
+rfm_concat AS (
+  SELECT
+    *,
+    CONCAT(RecencyScore, FrequencyScore, MonetaryScore) AS RFMScore
+  FROM rfm_Score
+),
+
+rfm_segment AS (
+  SELECT
+    *,
+    CASE
+      -- Dont change the order, it is checked iteratively
+      WHEN REGEXP_CONTAINS(RFMScore, "[4-5][4-5][4-5]") THEN "Champions"
+      WHEN REGEXP_CONTAINS(RFMScore, "[3-5][3-5][1-5]") THEN "Loyalists"
+      WHEN REGEXP_CONTAINS(RFMScore, "[3-5][2-3][1-3]") THEN "Potential Loyalists"
+      WHEN REGEXP_CONTAINS(RFMScore, "[3-5][1-2][1-5]") THEN "New Customers"
+      WHEN REGEXP_CONTAINS(RFMScore, "[2-4][4-5][1-3]") THEN "Promising"
+      WHEN REGEXP_CONTAINS(RFMScore, "[2-3]3[1-3]") THEN "Need Attention"
+      WHEN REGEXP_CONTAINS(RFMScore, "21[1-2]") THEN "About To Sleep"
+      WHEN REGEXP_CONTAINS(RFMScore, "2[1-5][3-5]") THEN "At Risk"
+      WHEN REGEXP_CONTAINS(RFMScore, "1[2-5][1-5]") THEN "Cant Lose Them"
+      WHEN REGEXP_CONTAINS(RFMScore, "[1-2]2[1-2]") THEN "Hibernating"
+      WHEN REGEXP_CONTAINS(RFMScore, "11[1-5]") THEN "Lost"
+      ELSE NULL
+    END AS RFMSegment
+  FROM rfm_concat
+)
+```
+
+Let's see the result
+
+``` {sql rfm-table-4}
+#| eval: false
+
+-- SELECT * FROM rfm_segment WHERE RFMSegment IS NULL
+
+SELECT * FROM rfm_segment ORDER BY Monetary DESC
+```
+
+``` {sql rfm-table-5}
+#| echo: false
+
+<<rfm-table-1>>
+
+<<rfm-table-2>>
+
+<<rfm-table-3>>
+
+<<rfm-table-4>>
+```
+
+### Add CLV to RFM table
+
+After we get the RFM score and segment, we can also calculate the CLV for each customer or segment. CLV (Customer Lifetime Value) is a metric that indicates the total revenue to reasonably expect from customers
+
+The general CLV formula is:
+
+``` math
+\begin{aligned}
+
+& CV=Average\ Order\ Value\times Purchase\ Frequency
+\\\\
+
+& CV=\frac{Total\ Purchase\ Value}{Number\ of\ Orders}\times\frac{Number\ of\ Orders}{Number\ of\ Unique\ Customers}
+\\\\
+
+& CV=\frac{Total\ Purchase\ Value}{Number\ of\ Unique\ Customers}
+\\\\
+
+& CLV=CV\times Expected\ Relationship\ Period
+
+\end{aligned}
+```
+
+Where:
+
+- AOV and PF is affected by time period. If the data period is 2 years and we want a yearly basis, then divide them by 2 (or 730 if in days) before multiplying them with expected relationship period
+- The number of unique customer is 1 for individual CLV, or N for N unique individuals in a customer segment (e.g. champions, loyalists)
+- Expected relationship can be defined freely, or by using tenure, or averaged tenure (if not individual CLV)
+- Total purchase value in this case is revenue/monetary value from our RFM analysis before
+
+If we want to use profit instead of revenue, then the formula can be modified slightly like below (choose either one):
+
+``` math
+\begin{aligned}
+
+& CLV\ =CV\times Expected\ Relationship\ Period-Other\ Cost
+\\\\
+
+& CLV\ =CV\times Expected\ Relationship\ Period\times Profit\ Margin
+
+\end{aligned}
+```
+
+Some other formulas also exist, see these references for starter:
+
+- Traditional CLV formula (for non-year-long relationship) from [Qualtrics](https://www.qualtrics.com/experience-management/customer/how-to-calculate-customer-lifetime-value/)
+- Methods for [Modelling Customer Lifetime Value](https://towardsdatascience.com/methods-for-modelling-customer-lifetime-value-the-good-stuff-and-the-gotchas-445f8a6587be) by Katherine Munro (also see [the next one](https://towardsdatascience.com/from-probabilistic-to-predictive-methods-for-mastering-customer-lifetime-value-72f090ebcde2))
+- CLV formula using BG-NBD from [Serdar Ozturk](https://www.kaggle.com/code/serdarsozturk/crm-buy-till-you-die) (includes churn rate, etc)
+- Descriptive, diagnostic, predictive, prescriptive analytics from [Zeid Zein](https://www.kaggle.com/code/ziedzen/customer-segmentation-rfm-clv-and-clustering)
+
+Now we calculate the individual and segmented CLV
+
+**TODO:** Mitigate the outliers ([reference](https://www.samthebrand.com/histograms-sql/))
+
+``` {sql clv-table-1}
+#| eval: false
+
+clv_helper AS (
+  SELECT
+    *,
+    -- Number of unique individuals per customer segment
+    COUNT(DISTINCT CustomerID) OVER(w) AS SegCustomers,
+    -- Observation period of whole table (in days)
+    DATE_DIFF(MAX(LastPurchase) OVER(), MIN(FirstPurchase) OVER(), DAY) AS ObservedRelationship,
+    -- Expected relationship period per customer segment (in days)
+    -- TODO: Check if using tenure is the right approach
+    AVG(Tenure) OVER(w) AS ExpectedRelationship
+  FROM rfm_segment
+  WINDOW w AS (PARTITION BY RFMSegment)
+),
+
+clv_individual AS (
+  SELECT
+    *,
+    -- Individual CLV
+    Monetary / ObservedRelationship * Tenure AS CLV
+  FROM clv_helper
+),
+
+clv_segmented AS (
+  SELECT
+    *,
+    -- Segmented CLV, by averaging individual CLV per segment
+    AVG(CLV) OVER(w) AS SegAvgCLV,
+    -- Segmented CLV, by recalculating CLV per segment
+    -- See individual CLV above for comparison
+    SUM(Monetary) OVER(w) / ObservedRelationship * ExpectedRelationship / SegCustomers AS SegAggCLV
+  FROM clv_individual
+  WINDOW w AS (PARTITION BY RFMSegment)
+)
+```
+
+``` {sql clv-table-2}
+#| eval: false
+
+SELECT * FROM clv_segmented ORDER BY Monetary DESC
+```
+
+``` {sql clv-table-3}
+#| echo: false
+
+<<rfm-table-1>>
+
+<<rfm-table-2>>
+
+<<rfm-table-3>>
+
+,
+
+<<clv-table-1>>
+
+<<clv-table-2>>
+```
+
+We can see that the individual CLV is always smaller than the monetary value from RFM
+
+This is because tenure (expected relationship) period is smaller than observation period. We can workaround this by changing it to a fixed value if needed (e.g. to 2 years or 730 days)
+
+Save the table as `rfm` (includes CLV above)
+
+``` {r clv-table-4}
+#| cache: false
+#| echo: false
+
+query <- '
+  <<rfm-table-1>>
+  <<rfm-table-2>>
+  <<rfm-table-3>>
+  ,
+  <<clv-table-1>>
+  <<clv-table-2>>
+'
+
+# Escape the newline character
+query <- gsub('\n', '\\\n', query)
+
+# Pass query string as environment variable
+# Also make sure that chunk cache is false
+# If cache is true then the env var may not be shared
+Sys.setenv(QUERY = query)
+```
+
+``` {sh clv-table-5}
+docker exec -e QUERY="$QUERY" bqc sh -c '
+  bq query --use_legacy_sql=false \
+  --destination_table sales_data.rfm \
+  --replace --max_rows=10 \
+  "$QUERY"
+'
+```
+
+In case we need it later, create customer segment description as separate table (`rfm_desc`)
+
+``` {sql segment-desc-1}
+#| eval: false
+
+SELECT
+  1 AS Number, "Champions" AS RFMSegment,
+  "Customers who visited most recently, most frequently, and spent the most" AS Description
+UNION ALL SELECT
+  2, "Loyalists",
+  "Customers who visited recently, frequently, and often spent a great amount"
+UNION ALL SELECT
+  3, "Potential Loyalist",
+  "New customers who bought frequently, and may need a little push to spend more money"
+UNION ALL SELECT
+  4, "New Customers",
+  "New customers who visited and bought recently, but not too often"
+UNION ALL SELECT
+  5, "Promising",
+  "Not so recent customers, but bought frequently and spent moderate amount in the past"
+UNION ALL SELECT
+  6, "Need Attention",
+  "Not so recent customers, but spent moderate amount in the past (not so frequent)"
+UNION ALL SELECT
+  7, "About To Sleep",
+  "Not so recent customers. Below-average recency, frequency, and monetary values"
+UNION ALL SELECT
+  8, "At Risk",
+  "Spent moderate to big amount of money, but long time ago. Reactivate before its too late!"
+UNION ALL SELECT
+  9, "Cant Lose Them",
+  "Used to buy frequently (low to big amount), but long time ago. Need to bring them back!"
+UNION ALL SELECT
+  10, "Hibernating",
+  "Last visited long time ago, visits are not often, and has not spent much"
+UNION ALL SELECT
+  11, "Lost",
+  "Last visited long time ago, only bought 1-2 times, not worth bringing back"
+```
+
+``` {r segment-desc-2}
+#| cache: false
+#| echo: false
+
+query <- '
+  <<segment-desc-1>>
+'
+
+# Escape the newline character
+query <- gsub('\n', '\\\n', query)
+
+# Pass query string as environment variable
+# Also make sure that chunk cache is false
+# If cache is true then the env var may not be shared
+Sys.setenv(QUERY = query)
+```
+
+``` {sh segment-desc-3}
+#| echo: false
+
+docker exec -e QUERY="$QUERY" bqc sh -c '
+  bq query --use_legacy_sql=false \
+  --destination_table sales_data.rfm_desc \
+  --replace --max_rows=10 \
+  "$QUERY"
+'
+```
+
+And also add the `RFMSegment` column to `transaction` table
+
+``` {sh segment-to-transaction}
+#| echo: false
+
+docker exec bqc sh -c '
+  bq query --use_legacy_sql=false \
+  --destination_table sales_data.transaction \
+  --replace --max_rows=10 \
+  "
+    SELECT
+      t.*,
+      rfm.RFMSegment
+    FROM
+      sales_data.transaction AS t
+    INNER JOIN
+      sales_data.rfm AS rfm
+    ON
+      t.CustomerID = rfm.CustomerID
+  "
+'
+```
+
+## Create Cohort Table
+
+Cohort analysis is a method to measure customer retention over time
+
+For example, you can see how many customers who registered on January and keep logging-in in February, March, and so on
+
+Let's try creating one
+
+``` {sql cohort-table-1}
+#| eval: false
+#| echo: false
+
+WITH cohort AS (
+  SELECT
+    CustomerID,
+    RFMSegment,
+    OrderID,
+    OrderTotalPrice,
+
+    -- Save first purchase date of the customer as first cohort
+    MIN(OrderDate) OVER(w) AS FirstCohort,
+    -- Month year of the first cohort (e.g. Jan 2020)
+    FORMAT_DATE("%b %Y", MIN(OrderDate) OVER(w)) AS FirstCohortMY,
+
+    -- Save every purchase date as cohort date too
+    OrderDate AS CurrentCohort,
+    -- Month year of this purchase/cohort date
+    FORMAT_DATE("%b %Y", OrderDate) AS CurrentCohortMY,
+  FROM
+    sales_data.transaction
+  WINDOW
+    w AS (PARTITION BY CustomerID)
+),
+
+agg_current_cohort AS (
+  SELECT
+    *,
+    -- Number of customers with the same first and current cohort period
+    COUNT(DISTINCT CustomerID) OVER(w) AS CurrentCohortCount,
+    -- Revenue of customers with the same first and current cohort period
+    SUM(OrderTotalPrice) OVER(w) AS CurrentCohortRevenue,
+    -- Month diff between the first cohort and current cohort
+    DATE_DIFF(CurrentCohort, FirstCohort, MONTH) AS CurrentCohortDistance
+  FROM
+    cohort
+  WINDOW
+    w AS (PARTITION BY FirstCohortMY, CurrentCohortMY)
+),
+
+agg_first_cohort AS (
+  SELECT
+    FirstCohortMY,
+    -- Calculate customers and revenue for first cohort too
+    -- Needed to show the true percentage in Looker Studio
+    COUNT(DISTINCT CustomerID) AS FirstCohortCount,
+    SUM(OrderTotalPrice) AS FirstCohortRevenue
+  FROM
+    cohort
+  GROUP BY
+    FirstCohortMY, CurrentCohortMY
+  HAVING
+    -- We cant use this condition with PARTITION BY
+    -- Hence we are using GROUP BY instead
+    FirstCohortMY = CurrentCohortMY
+),
+
+final_cohort AS (
+  SELECT
+    cc.CustomerID,
+    cc.RFMSegment,
+    cc.OrderID,
+    cc.OrderTotalPrice,
+
+    cc.FirstCohort,
+    cc.FirstCohortMY,
+    -- Added these 2 columns
+    fc.FirstCohortCount,
+    fc.FirstCohortRevenue,
+
+    cc.CurrentCohort,
+    cc.CurrentCohortMY,
+    -- Added these 2 columns
+    cc.CurrentCohortCount,
+    cc.CurrentCohortRevenue,
+
+    cc.CurrentCohortDistance
+  FROM
+    agg_current_cohort AS cc
+  INNER JOIN
+    agg_first_cohort AS fc
+  ON
+    cc.FirstCohortMY = fc.FirstCohortMY
+)
+```
+
+``` {sql cohort-table-2}
+#| eval: false
+
+<<cohort-table-1>>
+
+SELECT * FROM final_cohort ORDER BY FirstCohort, CurrentCohort
+```
+
+``` {r cohort-table-3}
+#| cache: false
+#| echo: false
+
+query <- '
+  <<cohort-table-2>>
+'
+
+# Escape the newline character
+query <- gsub('\n', '\\\n', query)
+
+# Pass query string as environment variable
+# Also make sure that chunk cache is false
+# If cache is true then the env var may not be shared
+Sys.setenv(QUERY = query)
+```
+
+``` {sh cohort-table-4}
+docker exec -e QUERY="$QUERY" bqc sh -c '
+  bq query --use_legacy_sql=false \
+  --destination_table sales_data.cohort \
+  --replace --max_rows=10 \
+  "$QUERY"
+'
+```
+
+**Note:** There can be multiple rows for each `CustomerID`, depending on how many purchase they made
+
+## Pivot the Cohort Table (Optional)
+
+Optional because we should actually do this within Looker Studio, not from SQL itself. I'm keeping this section for historical purpose
+
+The pivot table can be used to track how many customers are retained each month after the first cohort (i.e. purchase), so it will look more or less like this:
+
+| First Cohort | Count 0 | Count + 1 | Count + 2 | ... |
+| -- | -- | -- | -- | -- |
+| Jan 2020 | 191 users | 154 users | 130 users | ... |
+| Feb 2020 | 207 users | 181 users | 143 users | ... |
+| Mar 2020 | ... | ... | ... | ... | ... |
+
+Where:
+
+- Count 0 means how many **first time** customers purchased this month (e.g. in Jan 2020)
+- Count + 1 means how many customers keep purchasing 1 month after their first purchase (month 0)
+- Count + 2 means how many customers keep purchasing 2 months after their first purchase (month 0)
+- And so on
+
+The pivot query can be seen below (based on this [reference](https://cloud.google.com/bigquery/docs/reference/standard-sql/query-syntax#pivot_operator)). Where the query below is a continuation of the previous cohort query
+
+``` {sql cohort-table-5}
+#| eval: false
+
+SELECT * FROM
+  (
+    SELECT
+      -- Column(s) for group by
+      FirstCohortMY,
+      -- Column(s) to aggregate
+      CustomerID,
+      OrderTotalPrice,
+      -- Column to pivot
+      CurrentCohortDistance
+    FROM
+      final_cohort
+  )
+PIVOT
+  (
+    -- Column(s) to aggregate
+    -- We actually already did this before
+    COUNT(DISTINCT CustomerID) AS Count,
+    SUM(OrderTotalPrice) AS Revenue
+    -- Column to pivot
+    FOR CurrentCohortDistance IN (
+      0,1,2,3,4,5
+    )
+  )
+```
+
+```  {sql cohort-table-6}
+#| echo: false
+
+<<cohort-table-1>>
+
+<<cohort-table-5>>
+```
+
+Notice that I'm writing the months manually (the total are actually 0-23 months). I tried using `GENERATE_ARRAY` after the `IN` clause but it caused an error instead
+
+The other workaround is by using `EXECUTE IMMEDIATE` [procedure](https://cloud.google.com/bigquery/docs/reference/standard-sql/procedural-language) clause like below
+
+``` {sql cohort-table-7}
+#| eval: false
+
+DECLARE month STRING;
+SET month = (
+  SELECT TRIM(TO_JSON_STRING(GENERATE_ARRAY(1, 23)), "[]")
+);
+
+EXECUTE IMMEDIATE FORMAT(
+  """
+  SELECT * FROM
+    ( ... )
+  PIVOT
+    ( ... FOR CurrentCohortDistance IN (%s) )
+  """,
+  -- %s above will be replaced with month
+  month
+)
+```
+
+However, the `EXECUTE IMMEDIATE` result can't be chained/nested to other query (i.e. `CREATE TABLE`), because the result is not an actual table, but the execution output (string)
+
+If we try to pass it to the `bq` tool with `--destination_table`, we will get also error like below
+
+```
+BigQuery error in query operation: Error processing job
+'mumu-431300:bqjob_r6516573173b1596e_000001912dfa0e3f_1':
+configuration.query.destinationTable cannot be set for scripts
+```
+
+Unless we use `CREATE TABLE` directly within the `EXECUTION IMMEDIATE` statement
+
+**Note:** The preview code is skipped because it's too long (see the notebook source code if needed)
+
+``` {sql cohort-table-8}
+#| eval: false
+#| echo: false
+
+DECLARE month STRING;
+SET month = (
+  SELECT TRIM(TO_JSON_STRING(GENERATE_ARRAY(0, 23)), "[]")
+);
+
+EXECUTE IMMEDIATE FORMAT(
+  """
+  CREATE OR REPLACE TABLE
+    sales_data.cohort_pivot
+  AS (
+    <<cohort-table-1>>
+
+    SELECT * FROM
+      (
+        SELECT
+          -- Column(s) for group by
+          FirstCohortMY,
+          -- Column(s) to aggregate
+          CustomerID,
+          OrderTotalPrice,
+          -- Column to pivot
+          CurrentCohortDistance
+        FROM
+          final_cohort
+      )
+    PIVOT
+      (
+        -- Column(s) to aggregate
+        -- We actually already did this before
+        COUNT(DISTINCT CustomerID) AS Count,
+        SUM(OrderTotalPrice) AS Revenue
+        -- Column to pivot
+        FOR CurrentCohortDistance IN (%s)
+      )
+  );
+  """,
+  month
+)
+```
+
+``` {r cohort-table-9}
+#| cache: false
+#| echo: false
+
+query <- '
+  <<cohort-table-8>>
+'
+
+# Escape the newline character
+query <- gsub('\n', '\\\n', query)
+# Escape the percent character (except for %s)
+query <- gsub('%b %Y', '%%b %%Y', query)
+
+# Pass query string as environment variable
+# Also make sure that chunk cache is false
+# If cache is true then the env var may not be shared
+Sys.setenv(QUERY = query)
+```
+
+``` {sh cohort-table-10}
+docker exec -e QUERY="$QUERY" bqc sh -c '
+  bq query --use_legacy_sql=false \
+  "$QUERY"
+' | tail -n 5
+```
+
+Also worth noting that there is also `CREATE PROCEDURE` clause, which let us use arguments and call those codes like a function
+
+See the reference [here](https://cloud.google.com/bigquery/docs/procedures) since I think it's an overkill to implement in this case
+
+# Looker Studio
+
+**Note:** This section below is not actively updated since there are revisions here and there on the SQL tables, but it's mainly based on Bagus Akhlaq's [dashboard](https://lookerstudio.google.com/s/gVA0u4eJ-no) layout
+
+## BigQuery Data Source
+
+We will use at least 3 data sources (`transactions`, `rfm`, and `cohort`). We can initially use only one then add the rest when needed
+
+## Create a State Sales Geomap
+
+1. Add new chart and select "Filled map"
+2. Drag `CustomerState` to the chart location field
+
+    It will be recognized as text (ABC symbol), correct it by clicking the symbol, and change the data type to "Geo - Country Subdivision 1st Level"
+3. To change the color metric from `Record Count` to revenue (let's call it `TotalSales`), we can add a new calculated field first with the formula `OrderPrice * OrderQuantity` (if the field doesn't exist yet)
+4. Drag the newly created `TotalSales` to the color metric (the default will be SUM metric), and change the data type from numeric to currency if needed (by clicking the SUM symbol)
+5. The result will look more or less like this:
+
+    ![](misc/geomap.png)
+
+## Create a Sales and Order Time Series
+
+1. Add new chart and select "Time series chart" (or the smoothed one)
+2. Drag `TotalSales` (revenue) and `Record Count` to the chart metric, make sure they defaulted to SUM metric
+
+    Click the SUM symbol on `Record Count` and rename it to `Total Order` (and rename the sales too if needed)
+3. The `Total Order` will look like a flat line since it's too low compared to `TotalSales`
+
+    To fix this, click the chart "Style" tab, and change the axis to "Right" for series #2 (aka `Total Order`). Now there will be 2 Y-axis on the chart
+    ![](misc/timeseries1.png)
+4. One problem down, but now the date is too messy, we will want to break it down to monthly/quarterly period instead
+
+    Go back to "Setup" tab on the chart, and toggle the "Drill down" button. Now there will be 3 different `OrderDate` on the dimension section
+
+    Click the calendar symbol on the first one, and change the date type to "Year Quarter". Similarly, click on the second one and change the date type to "Year Month". Left the third one as it is (as daily date)
+
+    Change the default drill down type to "Year Quarter" (or click the up/down arrow symbol on the chart)
+4. To control the date range easily, we will "Add a control" (top menu of Looker) and select "Date range control". Select a custom range if you want (e.g. year 2021 only)
+5. The result will look more or less like this:
+    ![](misc/timeseries2.png)
+6. For more practice (optional metrics, showing comparison between year 2021 and the previous year, etc), see [this video](https://www.youtube.com/watch?v=w8mgkKslamI)
+
+## Add Sales, Order, etc Scorecards
+
+1. Add new chart and select "Scorecard" (or the compact one)
+2. Drag `TotalSales` to the chart metric, and rename it to `Total Sales` as usual
+3. Below the metric section, there is also sparkline section
+
+    Let's drag `OrderDate` to the sparkline. Then, change the data type to `Year Month` to smoothen it
+4. To make it even prettier, go to the chart "Style" tab, and check the "Fill" and "Smooth" checkbox under sparkline section
+    ![](misc/scorecard1.png)
+5. Also adjust the paddings to make it feel less spaced
+    ![](misc/scorecard2.png)
+6. Add other scorecards that you want (e.g. by copying this scorecard and changing the metric)
+
+## Add Pivot Cohort Table with Heatmap
+
+1. Add a new report page to use if needed
+2. Add new chart and select "Pivot table with heatmap" (or with bars, whichever you like). Note that pivot table is not the same as normal table
+3. Use the `cohort` SQL table we created earlier as data source (via "Add data" button)
+4. Drag `CurrentCohort` to date range dimension (since the auto picked one is `FirstCohort`)
+
+    Also drag `FirstCohortMY` (month year of the first cohort) to row dimension
+
+    And drag `CohortDistance` (months since the first cohort) to column dimension
+6. Lastly, drag `CustomerID` to the metric, and make sure "Count Distinct" is the aggregation method (instead of sum)
+
+    ![](misc/pivot_1.png)
+7. Now it's time for tweak the table appearance. Start by renaming the dimension/metric names
+7. To change the customer count to percentage, click the `CustomerID` metric and change the calculation method to "Percent of total"
+
+    However, if the percentage is wrong, we need to add a calculated field with the formula `CurrentCohortCount / FirstCohortCount * 100` and use that as the metric instead
+8. If the `FirstCohort` is sorted alphabetically instead of the real month order, we can also substitute it with calculated field `PARSE_DATE("%b %Y", FirstCohort)` to force recognize it as date. Change the data type as "Year Month" too by clicking the metric
+9. The final result should look more or less like this
+    ![](misc/pivot_2.png)
+10. Note that we can also show the row grand total on the chart, but it will only be accurate for customer count (not percent)
+
+    If we use percent it will divide/average the percent wrongly (since it's not using the actual count). The first month should be 117 / 1671 * 100 = 7%, but using the grand total it will be 7.83% instead
+
+    This is unfixable, the only (dirty) workaround is by providing our own grand total row/column
+10. Other than customer count, we can add the revenue metric too, but I'm not gonna cover it since the steps are almost the same as customer count
+
+## Final Dashboard
+

@@ -1,0 +1,8 @@
+/.venv/
+/.quarto/
+# Notebook cache
+/*_cache/
+# Email and other secret stuff
+/_environment
+# Google credentials data
+/docker/root/*
